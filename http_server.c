@@ -7,6 +7,8 @@
 #include "http_parser.h"
 #include "http_server.h"
 
+#define SEND_BUFFER_LEN 1024
+
 #define CRLF "\r\n"
 
 #define HTTP_RESPONSE_200_DUMMY                               \
@@ -19,6 +21,16 @@
     "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF     \
     "Content-Type: text/plain" CRLF "Content-Length: 12" CRLF \
     "Connection: Keep-Alive" CRLF CRLF "Hello World!" CRLF
+#define HTTP_RESPONSE_200_HTML                            \
+    ""                                                    \
+    "HTTP/1.1 200 OK" CRLF "Server: " KBUILD_MODNAME CRLF \
+    "Content-Type: text/html" CRLF "Connection: Close" CRLF CRLF
+#define HTML_TEMPLATE                                    \
+    ""                                                   \
+    "<html><head><style>\r\n"                            \
+    "body{font-family: monospace; font-size: 15px;}\r\n" \
+    "td {padding: 1.5px 6px;}\r\n"                       \
+    "</style></head><body><table>\r\n"
 #define HTTP_RESPONSE_501                                              \
     ""                                                                 \
     "HTTP/1.1 501 Not Implemented" CRLF "Server: " KBUILD_MODNAME CRLF \
@@ -39,8 +51,10 @@ struct http_request {
     struct socket *socket;
     enum http_method method;
     char request_url[128];
+    struct dir_context dir_context;
     int complete;
 };
+
 
 static int http_server_recv(struct socket *sock, char *buf, size_t size)
 {
@@ -76,20 +90,70 @@ static int http_server_send(struct socket *sock, const char *buf, size_t size)
     return done;
 }
 
-static int http_server_response(struct http_request *request, int keep_alive)
+static int trace_dir(struct dir_context *dir_context,
+                     const char *name,
+                     int namelen,
+                     loff_t offset,
+                     u64 ino,
+                     unsigned int d_type)
 {
-    char *response;
-
-    pr_info("requested_url = %s\n", request->request_url);
-    if (request->method != HTTP_GET)
-        response = keep_alive ? HTTP_RESPONSE_501_KEEPALIVE : HTTP_RESPONSE_501;
-    else
-        response = keep_alive ? HTTP_RESPONSE_200_KEEPALIVE_DUMMY
-                              : HTTP_RESPONSE_200_DUMMY;
-    http_server_send(request->socket, response, strlen(response));
+    if (strcmp(name, ".")) {
+        struct http_request *request =
+            container_of(dir_context, struct http_request, dir_context);
+        char buf[100] = {0};
+        snprintf(buf, 100, "<tr><td><a href=\"%s/%s\">%s</a></td></tr>\r\n",
+                 request->request_url, name, name);
+        http_server_send(request->socket, buf, strlen(buf));
+    }
     return 0;
 }
 
+static bool traverse_directory(struct http_request *request)
+{
+    char buf[SEND_BUFFER_LEN] = {0};
+
+    if (request->method != HTTP_GET) {
+        snprintf(buf, SEND_BUFFER_LEN, HTTP_RESPONSE_501);
+        http_server_send(request->socket, buf, strlen(buf));
+        return false;
+    }
+
+    snprintf(buf, SEND_BUFFER_LEN, HTTP_RESPONSE_200_HTML);
+    http_server_send(request->socket, buf, strlen(buf));
+    snprintf(buf, SEND_BUFFER_LEN, HTML_TEMPLATE);
+    http_server_send(request->socket, buf, strlen(buf));
+
+    struct file *fp;
+    fp = filp_open(request->request_url, O_RDONLY | O_DIRECTORY, 0);
+    if (IS_ERR(fp)) {
+        pr_info("open file failed");
+        return false;
+    }
+    request->dir_context.actor = trace_dir;
+    iterate_dir(fp, &request->dir_context);
+    snprintf(buf, SEND_BUFFER_LEN, "</table></body></html>\r\n");
+    http_server_send(request->socket, buf, strlen(buf));
+    filp_close(fp, NULL);
+    return true;
+}
+
+static int http_server_response(struct http_request *request, int keep_alive)
+{
+    // char *response;
+
+    // if (request->method != HTTP_GET)
+    //     response = keep_alive ? HTTP_RESPONSE_501_KEEPALIVE :
+    //     HTTP_RESPONSE_501;
+    // else
+    //     response = keep_alive ? HTTP_RESPONSE_200_KEEPALIVE_DUMMY
+    //                           : HTTP_RESPONSE_200_DUMMY;
+    // http_server_send(request->socket, response, strlen(response));
+    traverse_directory(request);
+
+    return 0;
+}
+
+// 初始話 request
 static int http_parser_callback_message_begin(http_parser *parser)
 {
     struct http_request *request = parser->data;
@@ -99,11 +163,15 @@ static int http_parser_callback_message_begin(http_parser *parser)
     return 0;
 }
 
+// 解析 url
 static int http_parser_callback_request_url(http_parser *parser,
                                             const char *p,
                                             size_t len)
 {
     struct http_request *request = parser->data;
+    pr_info("request url : %s\n", request->request_url);
+    if (p[len - 1] == '/')
+        --len;
     strncat(request->request_url, p, len);
     return 0;
 }
@@ -122,6 +190,7 @@ static int http_parser_callback_header_value(http_parser *parser,
     return 0;
 }
 
+// 解析 method ex: get, post
 static int http_parser_callback_headers_complete(http_parser *parser)
 {
     struct http_request *request = parser->data;
@@ -195,8 +264,9 @@ static void http_server_worker(struct work_struct *work)
             break;
         }
         http_parser_execute(&parser, &setting, buf, ret);
-        if (request.complete && !http_should_keep_alive(&parser))
+        if (request.complete && !http_should_keep_alive(&parser)) {
             break;
+        }
         memset(buf, 0, RECV_BUFFER_SIZE);
     }
     kernel_sock_shutdown(worker->sock, SHUT_RDWR);

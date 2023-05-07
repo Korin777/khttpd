@@ -306,7 +306,7 @@ static void *worker(void *arg)
                     /* check http response status code is 4XX or 5XX */
                     if (ec->offs <= 9 && ec->offs + ret > 10) {
                         char c = inbuf[9 - ec->offs];
-                        if (c == '4' || c == '5')
+                        if (c == '4' || c == '5')  // HTTP/X.X 200 OK
                             ec->flags |= BAD_REQUEST;
                     }
 
