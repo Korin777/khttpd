@@ -3,6 +3,7 @@
 #include <linux/kthread.h>
 #include <linux/sched/signal.h>
 #include <linux/tcp.h>
+#include <linux/timer.h>
 
 #include "http_parser.h"
 #include "http_server.h"
@@ -100,8 +101,9 @@ static int trace_dir(struct dir_context *dir_context,
     if (strcmp(name, ".")) {
         struct http_request *request =
             container_of(dir_context, struct http_request, dir_context);
-        char buf[100] = {0};
-        snprintf(buf, 100, "<tr><td><a href=\"%s/%s\">%s</a></td></tr>\r\n",
+        char buf[SEND_BUFFER_LEN] = {0};
+        snprintf(buf, SEND_BUFFER_LEN,
+                 "<tr><td><a href=\"%s/%s\">%s</a></td></tr>\r\n",
                  request->request_url, name, name);
         http_server_send(request->socket, buf, strlen(buf));
     }
@@ -169,10 +171,10 @@ static int http_parser_callback_request_url(http_parser *parser,
                                             size_t len)
 {
     struct http_request *request = parser->data;
-    pr_info("request url : %s\n", request->request_url);
     if (p[len - 1] == '/')
         --len;
     strncat(request->request_url, p, len);
+    pr_info("request url : %s/\n", request->request_url);
     return 0;
 }
 
@@ -226,11 +228,19 @@ static void free_work(void)
     }
 }
 
+void timer_callback(struct timer_list *arg)
+{
+    struct khttpd *worker = container_of(arg, struct khttpd, timer);
+    kernel_sock_shutdown(worker->sock, SHUT_RDWR);
+}
+
 
 // work item
 static void http_server_worker(struct work_struct *work)
 {
+    pr_info("connect\n");
     struct khttpd *worker = container_of(work, struct khttpd, khttpd_work);
+    timer_setup(&worker->timer, timer_callback, 0);
 
     char *buf;
     struct http_parser parser;
@@ -258,6 +268,7 @@ static void http_server_worker(struct work_struct *work)
     parser.data = &request;
     while (!daemon.is_stopped) {
         int ret = http_server_recv(worker->sock, buf, RECV_BUFFER_SIZE - 1);
+        pr_info("ret %d\n", ret);
         if (ret <= 0) {
             if (ret)
                 pr_err("recv error: %d\n", ret);
@@ -267,10 +278,14 @@ static void http_server_worker(struct work_struct *work)
         if (request.complete && !http_should_keep_alive(&parser)) {
             break;
         }
+        // timer update
+        mod_timer(&worker->timer, jiffies + msecs_to_jiffies(5000));
         memset(buf, 0, RECV_BUFFER_SIZE);
     }
+    del_timer_sync(&worker->timer);
     kernel_sock_shutdown(worker->sock, SHUT_RDWR);
     kfree(buf);
+    pr_info("close\n");
     return;
 }
 

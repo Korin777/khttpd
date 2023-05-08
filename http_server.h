@@ -12,6 +12,7 @@ struct khttpd {
     struct socket *sock;
     struct list_head list;
     struct work_struct khttpd_work;
+    struct timer_list timer;
 };
 
 struct http_service {
